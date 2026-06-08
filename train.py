@@ -16,6 +16,7 @@ TensorBoard
 import argparse
 from stable_baselines3 import PPO
 from env import BipedEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 
 def parse_args():
@@ -48,7 +49,7 @@ def parse_args():
     parser.add_argument(
         "--urdf",
         type=str,
-        default="biped/biped2d_pybullet.urdf",
+        default="biped2d_pybullet.urdf",
         help="URDF file path (searched in pybullet_data and working directory)",
     )
     parser.add_argument(
@@ -57,19 +58,34 @@ def parse_args():
         default=3e-4,
         help="PPO learning rate (default: 3e-4)",
     )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=4,
+        help="Number of parallel environments to run (default: 4)",
+    )
     return parser.parse_args()
+
+
+def make_env(rank, urdf_path, no_render):
+    """Helper to instantiate a BipedEnv in a separate subprocess."""
+    def _init():
+        # All environments use render_mode="direct" to satisfy Stable-Baselines3,
+        # but rank 0 overrides PyBullet to open a GUI window if no_render is False
+        force_gui = (not no_render) and (rank == 0)
+        return BipedEnv(render_mode="direct", urdf_path=urdf_path, force_gui=force_gui)
+    return _init
 
 
 def main():
     args = parse_args()
 
-    render_mode = "direct" if args.no_render else "human"
-
     # ---- Banner ---- #
     print("=" * 60)
-    print("  Biped PPO Training")
+    print("  Biped PPO Training (Parallelized)")
     print("=" * 60)
-    print(f"  Render mode   : {render_mode}")
+    print(f"  Parallel Envs : {args.num_envs}")
+    print(f"  GUI Visible   : {not args.no_render} (Rank 0 only)")
     print(f"  URDF          : {args.urdf}")
     print(f"  Timesteps     : {args.timesteps:,}")
     print(f"  Learning rate : {args.learning_rate}")
@@ -78,10 +94,19 @@ def main():
     print("=" * 60)
 
     # ---- Create environment ---- #
-    env = BipedEnv(render_mode=render_mode, urdf_path=args.urdf)
+    if args.num_envs > 1:
+        env_fns = [make_env(i, args.urdf, args.no_render) for i in range(args.num_envs)]
+        env = SubprocVecEnv(env_fns)
+        num_joints = env.get_attr("num_joints")[0]
+        joint_names = env.get_attr("joint_names")[0]
+    else:
+        render_mode = "direct" if args.no_render else "human"
+        env = BipedEnv(render_mode=render_mode, urdf_path=args.urdf)
+        num_joints = env.num_joints
+        joint_names = env.joint_names
 
-    print(f"\n  Joints found  : {env.num_joints}")
-    print(f"  Joint names   : {list(env.joint_names.values())}")
+    print(f"\n  Joints found  : {num_joints}")
+    print(f"  Joint names   : {list(joint_names.values())}")
     print(f"  Obs space     : {env.observation_space.shape}")
     print(f"  Action space  : {env.action_space.shape}")
     print("=" * 60)
@@ -105,14 +130,16 @@ def main():
 
     # ---- Train ---- #
     print("\nStarting training...\n")
-    model.learn(total_timesteps=args.timesteps)
-
-    # ---- Save ---- #
-    model.save(args.model_name)
-    print(f"\nModel saved to: {args.model_name}.zip")
-
-    env.close()
-    print("Training complete.")
+    try:
+        model.learn(total_timesteps=args.timesteps)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving current model state...")
+    finally:
+        # ---- Save ---- #
+        model.save(args.model_name)
+        print(f"\nModel saved to: {args.model_name}.zip")
+        env.close()
+        print("Training terminated/completed cleanly.")
 
 
 if __name__ == "__main__":

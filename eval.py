@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument(
         "--urdf",
         type=str,
-        default="biped/biped2d_pybullet.urdf",
+        default="biped2d_pybullet.urdf",
         help="URDF file path (searched in pybullet_data and working directory)",
     )
     parser.add_argument(

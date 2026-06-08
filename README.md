@@ -50,16 +50,18 @@ python viewer.py --no-gravity
 
 ### 2. Train a walking policy
 
-Run headless (no GUI — much faster, recommended for actual training):
+#### Headless Parallel Training (Fastest, recommended)
+Run multiple environments in parallel across your CPU cores without any GUI:
 
 ```bash
-python train.py --no-render
+python train.py --no-render --num-envs 8
 ```
 
-Or with the GUI visible so you can watch training live (slow):
+#### Parallel Training with Single-GUI Monitoring
+Run in parallel but open exactly **one** PyBullet GUI window (for the first environment) so you can watch progress live:
 
 ```bash
-python train.py
+python train.py --num-envs 4
 ```
 
 This saves the trained model to `biped_ppo.zip` when finished.
@@ -90,17 +92,36 @@ python eval.py --episodes 10
 tensorboard --logdir ./logs/
 ```
 
+#### Deciphering TensorBoard Metrics
+
+When monitoring training in TensorBoard, focus on these key graphs under the `rollout/` and `train/` sections:
+
+* **`rollout/ep_rew_mean` (Mean Episode Reward):** 
+  * *What to look for:* A steady, upward logarithmic curve. 
+  * *Interpretation:* Represents overall walking performance. Higher is better. A flatline means the robot has collapsed or is stuck in a local minimum (e.g., crouching statically).
+* **`rollout/ep_len_mean` (Mean Episode Length):** 
+  * *What to look for:* Climbing from very low numbers (20-50 steps) towards the maximum limit (`1000`).
+  * *Interpretation:* Represents survival time. When it reaches 1000, the robot successfully stands and walks for the entire duration of the episode without falling.
+* **`train/entropy_loss` (Policy Entropy):** 
+  * *What to look for:* A gradual downward slope (becoming less negative).
+  * *Interpretation:* Measures randomness/exploration. Starts high (random flailing) and should decline as the policy becomes confident in its actions.
+  * *Warning:* If it drops to zero too fast (e.g. within 50k steps), the robot has prematurely converged (e.g., locking its joints).
+* **`train/value_loss` (Value Loss):** 
+  * *What to look for:* Spikes early on, but stabilizes and trends downwards.
+  * *Interpretation:* Shows how well the Critic predicts rewards. Lower means the Critic has a highly accurate model of physical dynamics.
+
 ---
 
 ## Full Workflow (Train → Evaluate)
 
 ```bash
-# Step 1 — Train for 2 million steps (headless)
-python train.py --no-render --timesteps 2000000
+# Step 1 — Train for 2 million steps (headless, 4 parallel environments)
+python train.py --no-render --num-envs 4 --timesteps 2000000
 
 # Step 2 — Watch what it learned
 python eval.py --slow
 ```
+*Note: on an 8GB RAM Intel Core i5 8th Gen HP Probook 450 G6, the 2 million timesteps were computed within 2 hrs, going beyond 1,000,000 time steps during Training would be Overkill for this Simulation, unless you have better CPU Cores, or an RTX 4060 GPU for running multiple environments for training in Paralle. The commands for that are give below in CLI Options
 
 ---
 
@@ -117,8 +138,6 @@ python eval.py --slow
 ---
 
 ## CLI Options
-
-### viewer.py
 
 | Flag | Description |
 |---|---|
@@ -137,6 +156,7 @@ python eval.py --slow
 | `--model-name NAME` | Save filename (default: biped_ppo) |
 | `--urdf PATH` | URDF file to use |
 | `--learning-rate LR` | PPO learning rate (default: 3e-4) |
+| `--num-envs N` | Number of parallel environments (default: 4) |
 | `--log-dir DIR` | TensorBoard log directory (default: ./logs/) |
 
 ### eval.py

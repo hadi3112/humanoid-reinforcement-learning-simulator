@@ -39,11 +39,12 @@ class BipedEnv(gym.Env):
     def __init__(
         self,
         render_mode="human",
-        urdf_path="biped/biped2d_pybullet.urdf",
+        urdf_path="biped2d_pybullet.urdf",
         max_episode_steps=1000,
         max_torque=20.0,
         fall_threshold=None,
         initial_height=None,
+        force_gui=False,
     ):
         super().__init__()
 
@@ -55,7 +56,7 @@ class BipedEnv(gym.Env):
         # Determine appropriate initial spawn height and fall threshold based on URDF
         if initial_height is None:
             if "biped2d" in self.urdf_path:
-                self.initial_height = -0.32
+                self.initial_height = -0.388
             elif "12dof" in self.urdf_path:
                 self.initial_height = 0.31
             else:
@@ -77,7 +78,7 @@ class BipedEnv(gym.Env):
         self.prev_action = None
 
         # ---- Connect to PyBullet ---- #
-        if self.render_mode == "human":
+        if self.render_mode == "human" or force_gui:
             self.physics_client = p.connect(p.GUI)
             p.configureDebugVisualizer(
                 p.COV_ENABLE_GUI, 1, physicsClientId=self.physics_client
@@ -148,6 +149,8 @@ class BipedEnv(gym.Env):
         self._base_ang_vel_scale = 10.0      # rad/s
 
         self.prev_action = np.zeros(self.num_joints, dtype=np.float32)
+        self.goal_x = 20.0
+        self.prev_dist_to_goal = self.goal_x
 
     # ================================================================== #
     #  Internal helpers
@@ -251,37 +254,131 @@ class BipedEnv(gym.Env):
 
     def _compute_reward(self, action):
         """
-        reward = forward_velocity - energy_penalty - fall_penalty
+        reward = progress_reward + goal_reward + alive_bonus - energy_penalty - fall_penalty - crouch_penalty - symmetry_penalty - ankle_penalty - knee_penalty - torso_tilt_penalty
 
         Components
         ----------
-        forward_velocity : float
-            Linear velocity along the x-axis (positive = forward).
+        progress_reward : float
+            Reward for making forward progress towards goal_x. Weighted by 3.0 to prioritize forward walking.
+        goal_reward : float
+            Big bonus (+100.0) awarded once upon reaching goal_x.
+        alive_bonus : float
+            Encourages the robot to stay standing (+0.5 per step).
         energy_penalty : float
             0.001 * sum(action^2)  — discourages wasteful torques.
         fall_penalty : float
-            -100 applied once when the robot's torso drops below the
-            fall_threshold.
+            -100 applied once when the robot's torso drops below the fall_threshold.
+        crouch_penalty : float
+            Penalises both knees bending simultaneously to prevent crouching static states.
+        symmetry_penalty : float
+            Penalises in-phase hip movement to encourage out-of-phase leg swing.
+        ankle_penalty : float
+            Stiffens the ankles, penalizing flexion beyond minimal angles.
+        knee_penalty : float
+            Penalizes forward knee bending/extension past 0.
+        torso_tilt_penalty : float
+            Penalizes torso tilt away from upright.
         """
+        # Get torso and base info
         torso_height = self._get_torso_height()
-        base_lin_vel, _ = p.getBaseVelocity(
+        base_pos, base_quat = p.getBasePositionAndOrientation(
             self.robot_id, physicsClientId=self.physics_client
         )
 
-        forward_reward = float(base_lin_vel[0])
+        # Resolve 2D planar robot progress tracking: Y for biped2d, X otherwise.
+        if "biped2d" in self.urdf_path:
+            torso_state = p.getLinkState(self.robot_id, self.torso_link_id, physicsClientId=self.physics_client)
+            base_x = torso_state[0][1]
+            torso_quat = torso_state[1]
+            torso_euler = p.getEulerFromQuaternion(torso_quat)
+            pitch = torso_euler[0]
+        else:
+            base_x = base_pos[0]
+            base_euler = p.getEulerFromQuaternion(base_quat)
+            pitch = base_euler[1]
+
+        # 1. Goal progress reward (prioritized and scaled)
+        dist_to_goal = abs(self.goal_x - base_x)
+        progress = self.prev_dist_to_goal - dist_to_goal
+        # Scale progress to match velocity units (m/s) and multiply by 3.0 to prioritize forward movement
+        progress_reward = 3.0 * float(progress / self.time_step)
+        self.prev_dist_to_goal = dist_to_goal
+
+        # Goal reached bonus
+        goal_reward = 0.0
+        if base_x >= self.goal_x:
+            goal_reward = 100.0
+
+        # Alive bonus
+        alive_bonus = 0.5
+
+        # 2. Crouching & Symmetry Penalties
+        # Read joint states
+        joint_states = {}
+        for jid, name in self.joint_names.items():
+            state = p.getJointState(self.robot_id, jid, physicsClientId=self.physics_client)
+            joint_states[name] = state[0]
+
+        r_knee = joint_states.get("r_knee", 0.0)
+        l_knee = joint_states.get("l_knee", 0.0)
+        r_hip = joint_states.get("torso_to_rightleg", 0.0)
+        l_hip = joint_states.get("torso_to_leftleg", 0.0)
+        r_ankle = joint_states.get("r_ankle", 0.0)
+        l_ankle = joint_states.get("l_ankle", 0.0)
+
+        # Penalise both knees bending at the same time (double-knee buckling / crouching)
+        crouch_penalty = 2.0 * float(abs(r_knee * l_knee))
+        
+        # Penalise in-phase hip movement (encourage opposite swing of hips)
+        symmetry_penalty = 1.0 * float((r_hip + l_hip) ** 2)
+
+        # Restrict ankle joint rotation to minimal flexion (stiffen ankles)
+        ankle_penalty = 15.0 * (r_ankle**2 + l_ankle**2)
+
+        # Prevent forward knee bending (extension past 0 degrees)
+        knee_penalty = 10.0 * (max(0.0, -r_knee)**2 + max(0.0, -l_knee)**2)
+
+        # Penalize torso tilt
+        torso_tilt_penalty = 10.0 * (pitch**2)
+
+        # 3. Base reward components
         energy_penalty = 0.001 * float(np.sum(np.square(action)))
         fall_penalty = 100.0 if torso_height < self.fall_threshold else 0.0
 
-        return forward_reward - energy_penalty - fall_penalty
+        return progress_reward + goal_reward + alive_bonus - energy_penalty - fall_penalty - crouch_penalty - symmetry_penalty - ankle_penalty - knee_penalty - torso_tilt_penalty
 
     # ================================================================== #
     #  Termination / truncation
     # ================================================================== #
 
     def _is_terminated(self):
-        """True when the robot has fallen."""
+        """True when the robot has fallen, reached the goal, or tilted past 20 degrees."""
         torso_height = self._get_torso_height()
-        return bool(torso_height < self.fall_threshold)
+        if torso_height < self.fall_threshold:
+            return True
+
+        base_pos, base_quat = p.getBasePositionAndOrientation(
+            self.robot_id, physicsClientId=self.physics_client
+        )
+
+        if "biped2d" in self.urdf_path:
+            torso_state = p.getLinkState(self.robot_id, self.torso_link_id, physicsClientId=self.physics_client)
+            base_x = torso_state[0][1]
+            torso_quat = torso_state[1]
+            torso_euler = p.getEulerFromQuaternion(torso_quat)
+            pitch = torso_euler[0]
+        else:
+            base_x = base_pos[0]
+            base_euler = p.getEulerFromQuaternion(base_quat)
+            pitch = base_euler[1]
+
+        if base_x >= self.goal_x:
+            return True
+
+        if abs(pitch) > 0.35:  # Torso tilt limit of 20 degrees (~0.35 rad)
+            return True
+
+        return False
 
     def _is_truncated(self):
         """True when the episode has exceeded max_episode_steps."""
@@ -346,6 +443,7 @@ class BipedEnv(gym.Env):
 
         self.step_count = 0
         self.prev_action = np.zeros(self.num_joints, dtype=np.float32)
+        self.prev_dist_to_goal = self.goal_x
 
         return self._get_obs(), {}
 
