@@ -156,9 +156,21 @@ def main():
 
     print(f"\n  Actuated joints with sliders: {len(joint_ids)}")
     print()
+
+    # ---- Create camera target sliders ---- #
+    p.addUserDebugParameter("------------------", 1, 0, 1, physicsClientId=physics_client) # divider
+    cam_x_slider = p.addUserDebugParameter("Cam Target X", -5.0, 5.0, 0.0, physicsClientId=physics_client)
+    cam_y_slider = p.addUserDebugParameter("Cam Target Y", -5.0, 5.0, 0.0, physicsClientId=physics_client)
+    cam_z_slider = p.addUserDebugParameter("Cam Target Z", 0.0, 5.0, float(args.height * 0.5), physicsClientId=physics_client)
+
+    prev_cam_x = 0.0
+    prev_cam_y = 0.0
+    prev_cam_z = float(args.height * 0.5)
+
     print("=" * 60)
     print("  Drag the sliders on the right panel to move joints.")
-    print("  Use the mouse to rotate / zoom / pan the camera.")
+    print("  Use the mouse to orbit (click/drag), zoom (scroll), and pan (Ctrl+drag).")
+    print("  Alternatively, use the 'Cam Target' sliders to pan/focus the camera.")
     print("  Press Ctrl+C in the terminal to quit.")
     print("=" * 60)
     print()
@@ -166,6 +178,7 @@ def main():
     # ---- Main loop: read sliders → set joint positions ---- #
     try:
         while True:
+            # Update robot joint positions from sliders
             for idx, joint_id in enumerate(joint_ids):
                 target = p.readUserDebugParameter(
                     slider_ids[idx], physicsClientId=physics_client
@@ -178,6 +191,27 @@ def main():
                     force=50.0,
                     physicsClientId=physics_client,
                 )
+
+            # Update camera target position from sliders (preserving yaw, pitch, zoom)
+            cam_info = p.getDebugVisualizerCamera(physicsClientId=physics_client)
+            if cam_info is not None and len(cam_info) >= 11:
+                c_yaw = cam_info[8]
+                c_pitch = cam_info[9]
+                c_dist = cam_info[10]
+
+                cam_x = p.readUserDebugParameter(cam_x_slider, physicsClientId=physics_client)
+                cam_y = p.readUserDebugParameter(cam_y_slider, physicsClientId=physics_client)
+                cam_z = p.readUserDebugParameter(cam_z_slider, physicsClientId=physics_client)
+
+                if cam_x != prev_cam_x or cam_y != prev_cam_y or cam_z != prev_cam_z:
+                    p.resetDebugVisualizerCamera(
+                        cameraDistance=c_dist,
+                        cameraYaw=c_yaw,
+                        cameraPitch=c_pitch,
+                        cameraTargetPosition=[cam_x, cam_y, cam_z],
+                        physicsClientId=physics_client
+                    )
+                    prev_cam_x, prev_cam_y, prev_cam_z = cam_x, cam_y, cam_z
 
             p.stepSimulation(physicsClientId=physics_client)
 
