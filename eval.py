@@ -98,12 +98,12 @@ def main():
                     time.sleep(1.0 / 60.0)
 
                 if terminated or truncated:
-                    height = info.get("base_height", 0.0)
+                    height = info.get("torso_height", 0.0)
                     print(
                         f"  Episode {episode:4d}  |  "
                         f"Steps: {step:5d}  |  "
                         f"Reward: {episode_reward:9.2f}  |  "
-                        f"Height: {height:.3f}"
+                        f"Torso Height: {height:.3f}"
                     )
                     break
 
