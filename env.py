@@ -42,8 +42,8 @@ class BipedEnv(gym.Env):
         urdf_path="biped/biped2d_pybullet.urdf",
         max_episode_steps=1000,
         max_torque=20.0,
-        fall_threshold=0.3,
-        initial_height=1.0,
+        fall_threshold=None,
+        initial_height=None,
     ):
         super().__init__()
 
@@ -51,8 +51,28 @@ class BipedEnv(gym.Env):
         self.urdf_path = urdf_path
         self.max_episode_steps = max_episode_steps
         self.max_torque = max_torque
-        self.fall_threshold = fall_threshold
-        self.initial_height = initial_height
+        
+        # Determine appropriate initial spawn height and fall threshold based on URDF
+        if initial_height is None:
+            if "biped2d" in self.urdf_path:
+                self.initial_height = -0.32
+            elif "12dof" in self.urdf_path:
+                self.initial_height = 0.31
+            else:
+                self.initial_height = 1.0
+        else:
+            self.initial_height = initial_height
+
+        if fall_threshold is None:
+            if "biped2d" in self.urdf_path:
+                self.fall_threshold = 0.55
+            elif "12dof" in self.urdf_path:
+                self.fall_threshold = 0.15
+            else:
+                self.fall_threshold = 0.3
+        else:
+            self.fall_threshold = fall_threshold
+
         self.step_count = 0
         self.prev_action = None
 
@@ -88,6 +108,9 @@ class BipedEnv(gym.Env):
         self.joint_names = {}
         self._discover_joints()
         self.num_joints = len(self.joint_ids)
+
+        # ---- Discover torso link ---- #
+        self._discover_torso_link()
 
         if self.num_joints == 0:
             raise ValueError(
@@ -144,6 +167,30 @@ class BipedEnv(gym.Env):
                 if not any(v in jname for v in virtual_joints):
                     self.joint_ids.append(i)
                     self.joint_names[i] = jname
+
+    def _discover_torso_link(self):
+        """Find the link ID representing the main torso/body of the robot."""
+        self.torso_link_id = -1
+        total = p.getNumJoints(self.robot_id, physicsClientId=self.physics_client)
+        for i in range(total):
+            info = p.getJointInfo(self.robot_id, i, physicsClientId=self.physics_client)
+            child_name = info[12].decode("utf-8").lower()
+            if child_name in ["body", "torso", "pelvis", "waist"]:
+                self.torso_link_id = i
+                break
+
+    def _get_torso_height(self):
+        """Get the height (Z-coordinate) of the torso/body link, falling back to base height if not found."""
+        if self.torso_link_id == -1:
+            pos, _ = p.getBasePositionAndOrientation(
+                self.robot_id, physicsClientId=self.physics_client
+            )
+            return pos[2]
+        else:
+            state = p.getLinkState(
+                self.robot_id, self.torso_link_id, physicsClientId=self.physics_client
+            )
+            return state[0][2]
 
     def _disable_default_motors(self):
         """Set default motor forces to zero for all joints in the robot so passive/virtual joints can move freely and active joints are not resisted."""
@@ -213,19 +260,17 @@ class BipedEnv(gym.Env):
         energy_penalty : float
             0.001 * sum(action^2)  — discourages wasteful torques.
         fall_penalty : float
-            -100 applied once when the robot's base drops below the
+            -100 applied once when the robot's torso drops below the
             fall_threshold.
         """
-        base_pos, _ = p.getBasePositionAndOrientation(
-            self.robot_id, physicsClientId=self.physics_client
-        )
+        torso_height = self._get_torso_height()
         base_lin_vel, _ = p.getBaseVelocity(
             self.robot_id, physicsClientId=self.physics_client
         )
 
         forward_reward = float(base_lin_vel[0])
         energy_penalty = 0.001 * float(np.sum(np.square(action)))
-        fall_penalty = 100.0 if base_pos[2] < self.fall_threshold else 0.0
+        fall_penalty = 100.0 if torso_height < self.fall_threshold else 0.0
 
         return forward_reward - energy_penalty - fall_penalty
 
@@ -235,10 +280,8 @@ class BipedEnv(gym.Env):
 
     def _is_terminated(self):
         """True when the robot has fallen."""
-        base_pos, _ = p.getBasePositionAndOrientation(
-            self.robot_id, physicsClientId=self.physics_client
-        )
-        return bool(base_pos[2] < self.fall_threshold)
+        torso_height = self._get_torso_height()
+        return bool(torso_height < self.fall_threshold)
 
     def _is_truncated(self):
         """True when the episode has exceeded max_episode_steps."""
@@ -271,11 +314,7 @@ class BipedEnv(gym.Env):
 
         info = {
             "step": self.step_count,
-            "base_height": float(
-                p.getBasePositionAndOrientation(
-                    self.robot_id, physicsClientId=self.physics_client
-                )[0][2]
-            ),
+            "torso_height": float(self._get_torso_height()),
         }
 
         self.prev_action = action.copy()
@@ -300,8 +339,9 @@ class BipedEnv(gym.Env):
             physicsClientId=self.physics_client,
         )
 
-        # Re-discover joints and disable default motors
+        # Re-discover joints, torso link, and disable default motors
         self._discover_joints()
+        self._discover_torso_link()
         self._disable_default_motors()
 
         self.step_count = 0
