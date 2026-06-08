@@ -146,11 +146,12 @@ class BipedEnv(gym.Env):
                     self.joint_names[i] = jname
 
     def _disable_default_motors(self):
-        """Set default motor forces to zero so torque control is not resisted."""
-        for j in self.joint_ids:
+        """Set default motor forces to zero for all joints in the robot so passive/virtual joints can move freely and active joints are not resisted."""
+        total = p.getNumJoints(self.robot_id, physicsClientId=self.physics_client)
+        for i in range(total):
             p.setJointMotorControl2(
                 self.robot_id,
-                j,
+                i,
                 controlMode=p.VELOCITY_CONTROL,
                 force=0.0,
                 physicsClientId=self.physics_client,
