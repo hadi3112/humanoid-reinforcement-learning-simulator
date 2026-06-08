@@ -131,16 +131,19 @@ class BipedEnv(gym.Env):
     # ================================================================== #
 
     def _discover_joints(self):
-        """Find all revolute and prismatic joints in the loaded URDF."""
+        """Find all actuated revolute and prismatic joints in the loaded URDF, excluding virtual constraint joints."""
         self.joint_ids = []
         self.joint_names = {}
+        virtual_joints = ["y_to_world", "z_to_y", "torso_to_z"]
         total = p.getNumJoints(self.robot_id, physicsClientId=self.physics_client)
         for i in range(total):
             info = p.getJointInfo(self.robot_id, i, physicsClientId=self.physics_client)
             jtype = info[2]
+            jname = info[1].decode("utf-8")
             if jtype in (p.JOINT_REVOLUTE, p.JOINT_PRISMATIC):
-                self.joint_ids.append(i)
-                self.joint_names[i] = info[1].decode("utf-8")
+                if not any(v in jname for v in virtual_joints):
+                    self.joint_ids.append(i)
+                    self.joint_names[i] = jname
 
     def _disable_default_motors(self):
         """Set default motor forces to zero so torque control is not resisted."""
