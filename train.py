@@ -47,6 +47,12 @@ def parse_args():
         help="TensorBoard log directory (default: ./logs/)",
     )
     parser.add_argument(
+        "--load-model",
+        type=str,
+        default="",
+        help="Path to an existing model zip file to load and resume training (default: empty, train from scratch)",
+    )
+    parser.add_argument(
         "--urdf",
         type=str,
         default="biped2d_pybullet.urdf",
@@ -89,6 +95,10 @@ def main():
     print(f"  URDF          : {args.urdf}")
     print(f"  Timesteps     : {args.timesteps:,}")
     print(f"  Learning rate : {args.learning_rate}")
+    if args.load_model:
+        print(f"  Load Model    : {args.load_model}")
+    else:
+        print("  Load Model    : None (training from scratch)")
     print(f"  Model name    : {args.model_name}")
     print(f"  Log directory : {args.log_dir}")
     print("=" * 60)
@@ -111,22 +121,42 @@ def main():
     print(f"  Action space  : {env.action_space.shape}")
     print("=" * 60)
 
-    # ---- Create PPO agent ---- #
-    model = PPO(
-        policy="MlpPolicy",
-        env=env,
-        verbose=1,
-        tensorboard_log=args.log_dir,
-        learning_rate=args.learning_rate,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        device="auto",
-    )
+    # ---- Create or load PPO agent ---- #
+    if args.load_model:
+        load_path = args.load_model
+        if load_path.endswith(".zip"):
+            load_path = load_path[:-4]
+        print(f"\nLoading existing model checkpoint from: {load_path}.zip")
+        
+        from stable_baselines3.common.utils import get_schedule_fn
+        lr_schedule = get_schedule_fn(args.learning_rate)
+        custom_objects = {
+            "learning_rate": args.learning_rate,
+            "lr_schedule": lr_schedule,
+        }
+        model = PPO.load(load_path, env=env, tensorboard_log=args.log_dir, custom_objects=custom_objects)
+        
+        # Explicitly apply to model properties and optimizer param groups
+        model.learning_rate = args.learning_rate
+        model.lr_schedule = lr_schedule
+        for param_group in model.policy.optimizer.param_groups:
+            param_group["lr"] = args.learning_rate
+    else:
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            verbose=1,
+            tensorboard_log=args.log_dir,
+            learning_rate=args.learning_rate,
+            n_steps=2048,
+            batch_size=64,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            device="auto",
+        )
 
     # ---- Train ---- #
     print("\nStarting training...\n")
