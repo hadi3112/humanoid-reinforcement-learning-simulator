@@ -41,7 +41,7 @@ class BipedEnv(gym.Env):
         render_mode="human",
         urdf_path="biped2d_pybullet.urdf",
         max_episode_steps=1000,
-        max_torque=20.0,
+        max_torque=40.0,
         fall_threshold=None,
         initial_height=None,
         force_gui=False,
@@ -108,7 +108,17 @@ class BipedEnv(gym.Env):
         self.joint_ids = []
         self.joint_names = {}
         self._discover_joints()
+        self._update_joint_max_torques()
         self.num_joints = len(self.joint_ids)
+
+        # ---- Discover ankle joint IDs for contact checking ---- #
+        self.r_ankle_id = -1
+        self.l_ankle_id = -1
+        for jid, name in self.joint_names.items():
+            if "r_ankle" in name:
+                self.r_ankle_id = jid
+            elif "l_ankle" in name:
+                self.l_ankle_id = jid
 
         # ---- Discover torso link ---- #
         self._discover_torso_link()
@@ -171,6 +181,25 @@ class BipedEnv(gym.Env):
                     self.joint_ids.append(i)
                     self.joint_names[i] = jname
 
+    def _update_joint_max_torques(self):
+        """Set joint-specific maximum torque limits to enforce structural hierarchy."""
+        self.joint_max_torques = []
+        limits = {
+            "rightleg": 20.0,
+            "leftleg": 20.0,
+            "hip": 20.0,
+            "knee": 15.0,
+            "ankle": 10.0,
+        }
+        for jid in self.joint_ids:
+            name = self.joint_names[jid].lower()
+            limit = self.max_torque  # Default fallback
+            for key, val in limits.items():
+                if key in name:
+                    limit = val
+                    break
+            self.joint_max_torques.append(limit)
+
     def _discover_torso_link(self):
         """Find the link ID representing the main torso/body of the robot."""
         self.torso_link_id = -1
@@ -227,13 +256,25 @@ class BipedEnv(gym.Env):
             joint_pos.append(state[0])
             joint_vel.append(state[1])
 
-        base_pos, base_quat = p.getBasePositionAndOrientation(
-            self.robot_id, physicsClientId=self.physics_client
-        )
+        if "biped2d" in self.urdf_path:
+            torso_state = p.getLinkState(
+                self.robot_id,
+                self.torso_link_id,
+                computeLinkVelocity=1,
+                physicsClientId=self.physics_client,
+            )
+            base_pos = torso_state[0]
+            base_quat = torso_state[1]
+            base_lin_vel = torso_state[6]
+            base_ang_vel = torso_state[7]
+        else:
+            base_pos, base_quat = p.getBasePositionAndOrientation(
+                self.robot_id, physicsClientId=self.physics_client
+            )
+            base_lin_vel, base_ang_vel = p.getBaseVelocity(
+                self.robot_id, physicsClientId=self.physics_client
+            )
         base_euler = p.getEulerFromQuaternion(base_quat)
-        base_lin_vel, base_ang_vel = p.getBaseVelocity(
-            self.robot_id, physicsClientId=self.physics_client
-        )
 
         obs = np.concatenate(
             [
@@ -287,15 +328,21 @@ class BipedEnv(gym.Env):
 
         # Resolve 2D planar robot progress tracking: Y for biped2d, X otherwise.
         if "biped2d" in self.urdf_path:
-            torso_state = p.getLinkState(self.robot_id, self.torso_link_id, physicsClientId=self.physics_client)
+            torso_state = p.getLinkState(self.robot_id, self.torso_link_id, computeLinkVelocity=1, physicsClientId=self.physics_client)
             base_x = torso_state[0][1]
             torso_quat = torso_state[1]
             torso_euler = p.getEulerFromQuaternion(torso_quat)
             pitch = torso_euler[0]
+            torso_ang_vel_x = torso_state[7][0]
         else:
             base_x = base_pos[0]
             base_euler = p.getEulerFromQuaternion(base_quat)
             pitch = base_euler[1]
+            if len(base_pos) > 0 and len(base_quat) > 0:
+                _, base_ang_vel = p.getBaseVelocity(self.robot_id, physicsClientId=self.physics_client)
+                torso_ang_vel_x = base_ang_vel[1]
+            else:
+                torso_ang_vel_x = 0.0
 
         # 1. Goal progress reward (prioritized and scaled)
         dist_to_goal = abs(self.goal_x - base_x)
@@ -304,13 +351,20 @@ class BipedEnv(gym.Env):
         progress_reward = 3.0 * float(progress / self.time_step)
         self.prev_dist_to_goal = dist_to_goal
 
+        # Scale positive progress reward based on torso pitch to prevent falling forward reward hacking
+        if progress_reward > 0.0:
+            pitch_limit = 0.20
+            pitch_scale = max(0.0, 1.0 - abs(pitch) / pitch_limit)
+            progress_reward = progress_reward * pitch_scale
+
         # Goal reached bonus
         goal_reward = 0.0
         if base_x >= self.goal_x:
             goal_reward = 100.0
 
-        # Alive bonus
-        alive_bonus = 0.5
+        # Alive bonus scaled by forward velocity to discourage standing still
+        forward_vel = progress / self.time_step
+        alive_bonus = 0.5 * max(0.0, float(forward_vel))
 
         # 2. Crouching & Symmetry Penalties
         # Read joint states
@@ -333,19 +387,44 @@ class BipedEnv(gym.Env):
         symmetry_penalty = 1.0 * float((r_hip + l_hip) ** 2)
 
         # Restrict ankle joint rotation to minimal flexion (stiffen ankles)
-        ankle_penalty = 15.0 * (r_ankle**2 + l_ankle**2)
+        ankle_penalty = 5.0 * (r_ankle**2 + l_ankle**2)
 
         # Prevent forward knee bending (extension past 0 degrees)
-        knee_penalty = 10.0 * (max(0.0, -r_knee)**2 + max(0.0, -l_knee)**2)
+        knee_penalty = 10.0 * (max(0.0, r_knee)**2 + max(0.0, l_knee)**2)
 
         # Penalize torso tilt
         torso_tilt_penalty = 10.0 * (pitch**2)
 
         # 3. Base reward components
         energy_penalty = 0.001 * float(np.sum(np.square(action)))
-        fall_penalty = 100.0 if torso_height < self.fall_threshold else 0.0
+        # Penalize both height drops and excessive tilts as falls
+        fall_penalty = 20.0 if (torso_height < self.fall_threshold or abs(pitch) > 0.35) else 0.0
 
-        return progress_reward + goal_reward + alive_bonus - energy_penalty - fall_penalty - crouch_penalty - symmetry_penalty - ankle_penalty - knee_penalty - torso_tilt_penalty
+        # 4. Contact-based and motion penalties/rewards
+        swing_hip_penalty = 0.0
+        double_support_penalty = 0.0
+        torso_vel_penalty = 0.5 * (torso_ang_vel_x ** 2)
+        
+        # Split hip reward: encourage splitting the legs to take steps
+        hip_split_reward = 1.0 * float(abs(r_hip - l_hip))
+
+        if self.r_ankle_id != -1 and self.l_ankle_id != -1:
+            r_contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.plane_id, linkIndexA=self.r_ankle_id, physicsClientId=self.physics_client)
+            l_contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.plane_id, linkIndexA=self.l_ankle_id, physicsClientId=self.physics_client)
+            r_contact = len(r_contacts) > 0
+            l_contact = len(l_contacts) > 0
+
+            # Swing hip penalty: if a foot is in the air, its hip should swing forward (positive)
+            if not r_contact and r_hip < 0.0:
+                swing_hip_penalty += 5.0 * (r_hip ** 2)
+            if not l_contact and l_hip < 0.0:
+                swing_hip_penalty += 5.0 * (l_hip ** 2)
+
+            # Double support penalty: penalize having both feet on the ground to encourage stepping
+            if r_contact and l_contact:
+                double_support_penalty = 1.0
+
+        return progress_reward + goal_reward + alive_bonus + hip_split_reward - energy_penalty - fall_penalty - crouch_penalty - symmetry_penalty - ankle_penalty - knee_penalty - torso_tilt_penalty - swing_hip_penalty - double_support_penalty - torso_vel_penalty
 
     # ================================================================== #
     #  Termination / truncation
@@ -391,13 +470,13 @@ class BipedEnv(gym.Env):
     def step(self, action):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
 
-        # Apply torques to every actuated joint
+        # Apply torques to every actuated joint using joint-specific max torque limits
         for i, j in enumerate(self.joint_ids):
             p.setJointMotorControl2(
                 bodyUniqueId=self.robot_id,
                 jointIndex=j,
                 controlMode=p.TORQUE_CONTROL,
-                force=float(action[i] * self.max_torque),
+                force=float(action[i] * self.joint_max_torques[i]),
                 physicsClientId=self.physics_client,
             )
 
@@ -438,8 +517,34 @@ class BipedEnv(gym.Env):
 
         # Re-discover joints, torso link, and disable default motors
         self._discover_joints()
+        self._update_joint_max_torques()
         self._discover_torso_link()
         self._disable_default_motors()
+
+        # Discover ankle joint IDs for contact checking
+        self.r_ankle_id = -1
+        self.l_ankle_id = -1
+        for jid, name in self.joint_names.items():
+            if "r_ankle" in name:
+                self.r_ankle_id = jid
+            elif "l_ankle" in name:
+                self.l_ankle_id = jid
+
+        # Initialize default joint positions for stable starting stance (slightly bent knees)
+        if "biped2d" in self.urdf_path:
+            init_joints = {
+                "r_knee": -0.3,
+                "l_knee": -0.3,
+            }
+            for jid, name in self.joint_names.items():
+                if name in init_joints:
+                    p.resetJointState(
+                        self.robot_id,
+                        jid,
+                        init_joints[name],
+                        targetVelocity=0.0,
+                        physicsClientId=self.physics_client,
+                    )
 
         self.step_count = 0
         self.prev_action = np.zeros(self.num_joints, dtype=np.float32)
