@@ -66,7 +66,7 @@ class BipedEnv(gym.Env):
 
         if fall_threshold is None:
             if "biped2d" in self.urdf_path:
-                self.fall_threshold = 0.55
+                self.fall_threshold = 0.50
             elif "12dof" in self.urdf_path:
                 self.fall_threshold = 0.15
             else:
@@ -161,6 +161,8 @@ class BipedEnv(gym.Env):
         self.prev_action = np.zeros(self.num_joints, dtype=np.float32)
         self.goal_x = 20.0
         self.prev_dist_to_goal = self.goal_x
+        self.prev_stance_foot = None
+        self.last_alternation_x = 0.0
 
     # ================================================================== #
     #  Internal helpers
@@ -347,13 +349,13 @@ class BipedEnv(gym.Env):
         # 1. Goal progress reward (prioritized and scaled)
         dist_to_goal = abs(self.goal_x - base_x)
         progress = self.prev_dist_to_goal - dist_to_goal
-        # Scale progress to match velocity units (m/s) and multiply by 3.0 to prioritize forward movement
-        progress_reward = 3.0 * float(progress / self.time_step)
+        # Scale progress to match velocity units (m/s) and multiply by 10.0 to heavily prioritize walking
+        progress_reward = 10.0 * float(progress / self.time_step)
         self.prev_dist_to_goal = dist_to_goal
 
         # Scale positive progress reward based on torso pitch to prevent falling forward reward hacking
         if progress_reward > 0.0:
-            pitch_limit = 0.20
+            pitch_limit = 0.50
             pitch_scale = max(0.0, 1.0 - abs(pitch) / pitch_limit)
             progress_reward = progress_reward * pitch_scale
 
@@ -362,16 +364,17 @@ class BipedEnv(gym.Env):
         if base_x >= self.goal_x:
             goal_reward = 100.0
 
-        # Alive bonus scaled by forward velocity to discourage standing still
-        forward_vel = progress / self.time_step
-        alive_bonus = 0.5 * max(0.0, float(forward_vel))
+        # Alive bonus (constant per step to reward standing and balancing)
+        alive_bonus = 2.0
 
-        # 2. Crouching & Symmetry Penalties
-        # Read joint states
+        # 2. Crouching, Symmetry & Joint dynamics Penalties
+        # Read joint states and velocities
         joint_states = {}
+        joint_vels = {}
         for jid, name in self.joint_names.items():
             state = p.getJointState(self.robot_id, jid, physicsClientId=self.physics_client)
             joint_states[name] = state[0]
+            joint_vels[name] = state[1]
 
         r_knee = joint_states.get("r_knee", 0.0)
         l_knee = joint_states.get("l_knee", 0.0)
@@ -384,7 +387,7 @@ class BipedEnv(gym.Env):
         crouch_penalty = 2.0 * float(abs(r_knee * l_knee))
         
         # Penalise in-phase hip movement (encourage opposite swing of hips)
-        symmetry_penalty = 1.0 * float((r_hip + l_hip) ** 2)
+        symmetry_penalty = 3.0 * float((r_hip + l_hip) ** 2)
 
         # Restrict ankle joint rotation to minimal flexion (stiffen ankles)
         ankle_penalty = 5.0 * (r_ankle**2 + l_ankle**2)
@@ -398,16 +401,29 @@ class BipedEnv(gym.Env):
         # 3. Base reward components
         energy_penalty = 0.001 * float(np.sum(np.square(action)))
         # Penalize both height drops and excessive tilts as falls
-        fall_penalty = 20.0 if (torso_height < self.fall_threshold or abs(pitch) > 0.35) else 0.0
+        fall_penalty = 50.0 if (torso_height < self.fall_threshold or abs(pitch) > 0.70) else 0.0
 
         # 4. Contact-based and motion penalties/rewards
         swing_hip_penalty = 0.0
+        stance_hip_penalty = 0.0
         double_support_penalty = 0.0
+        gait_coordination_reward = 0.0
         torso_vel_penalty = 0.5 * (torso_ang_vel_x ** 2)
         
         # Split hip reward: encourage splitting the legs to take steps
-        hip_split_reward = 1.0 * float(abs(r_hip - l_hip))
+        hip_split_reward = 3.0 * float(abs(r_hip - l_hip))
 
+        # Damp high-frequency ankle flailing (velocity damping)
+        r_ankle_vel = joint_vels.get("r_ankle", 0.0)
+        l_ankle_vel = joint_vels.get("l_ankle", 0.0)
+        ankle_vel_penalty = 0.1 * (r_ankle_vel**2 + l_ankle_vel**2)
+
+        # Heavy penalty for staying still beyond the first few seconds (480 steps = 2.0s)
+        no_progress_penalty = 0.0
+        if self.step_count > 480 and base_x < 0.5:
+            no_progress_penalty = 100.0
+
+        alternation_reward = 0.0
         if self.r_ankle_id != -1 and self.l_ankle_id != -1:
             r_contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.plane_id, linkIndexA=self.r_ankle_id, physicsClientId=self.physics_client)
             l_contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.plane_id, linkIndexA=self.l_ankle_id, physicsClientId=self.physics_client)
@@ -420,11 +436,56 @@ class BipedEnv(gym.Env):
             if not l_contact and l_hip < 0.0:
                 swing_hip_penalty += 5.0 * (l_hip ** 2)
 
-            # Double support penalty: penalize having both feet on the ground to encourage stepping
-            if r_contact and l_contact:
-                double_support_penalty = 1.0
+            # Stance hip penalty: if a foot is on the ground and the other is swinging, stance hip should go backward (negative)
+            if r_contact and not l_contact and r_hip > 0.0:
+                stance_hip_penalty += 5.0 * (r_hip ** 2)
+            if l_contact and not r_contact and l_hip > 0.0:
+                stance_hip_penalty += 5.0 * (l_hip ** 2)
 
-        return progress_reward + goal_reward + alive_bonus + hip_split_reward - energy_penalty - fall_penalty - crouch_penalty - symmetry_penalty - ankle_penalty - knee_penalty - torso_tilt_penalty - swing_hip_penalty - double_support_penalty - torso_vel_penalty
+            # Gait coordination reward: encourages one hip to flex forward (positive) while the opposing hip extends backward (negative)
+            if r_contact and not l_contact:
+                # Right foot is stance (should be backward), Left foot is swing (should be forward)
+                gait_coordination_reward = 5.0 * (max(0.0, l_hip) - min(0.0, r_hip))
+            elif l_contact and not r_contact:
+                # Left foot is stance (should be backward), Right foot is swing (should be forward)
+                gait_coordination_reward = 5.0 * (max(0.0, r_hip) - min(0.0, l_hip))
+
+            # Double support penalty: penalize standing still, but allow dynamic transitions
+            settling_steps = 100
+            if self.step_count > settling_steps:
+                if r_contact and l_contact:
+                    # Get current forward velocity (m/s)
+                    if "biped2d" in self.urdf_path:
+                        torso_state = p.getLinkState(self.robot_id, self.torso_link_id, computeLinkVelocity=1, physicsClientId=self.physics_client)
+                        v_x = torso_state[6][1]  # Y velocity is forward in biped2d URDF frame
+                    else:
+                        v_x = base_lin_vel[0]
+
+                    target_v = 0.20
+                    if v_x < target_v:
+                        # Penalty scales from 10.0 (stopped) down to 0.0 (moving at >= target_v)
+                        double_support_penalty = 10.0 * (1.0 - max(0.0, v_x) / target_v)
+
+            # Stance / Contact Alternation Reward
+            if l_contact and not r_contact:
+                current_stance = "left"
+            elif r_contact and not l_contact:
+                current_stance = "right"
+            else:
+                current_stance = None
+
+            if current_stance is not None and self.prev_stance_foot is not None:
+                if current_stance != self.prev_stance_foot:
+                    progress_since_last = base_x - self.last_alternation_x
+                    if progress_since_last > 0.03:
+                        alternation_reward = 50.0 * float(progress_since_last)
+                        self.prev_stance_foot = current_stance
+                        self.last_alternation_x = base_x
+            elif self.prev_stance_foot is None and current_stance is not None:
+                self.prev_stance_foot = current_stance
+                self.last_alternation_x = base_x
+
+        return progress_reward + goal_reward + alive_bonus + hip_split_reward + gait_coordination_reward + alternation_reward - energy_penalty - fall_penalty - crouch_penalty - symmetry_penalty - ankle_penalty - knee_penalty - torso_tilt_penalty - swing_hip_penalty - stance_hip_penalty - double_support_penalty - torso_vel_penalty - ankle_vel_penalty - no_progress_penalty
 
     # ================================================================== #
     #  Termination / truncation
@@ -454,7 +515,11 @@ class BipedEnv(gym.Env):
         if base_x >= self.goal_x:
             return True
 
-        if abs(pitch) > 0.35:  # Torso tilt limit of 20 degrees (~0.35 rad)
+        if abs(pitch) > 0.70:  # Torso tilt limit of 40 degrees (~0.70 rad)
+            return True
+
+        # Enforce early termination if no significant progress is made after 2.0 seconds (480 steps)
+        if self.step_count > 480 and base_x < 0.5:
             return True
 
         return False
@@ -532,7 +597,12 @@ class BipedEnv(gym.Env):
 
         # Initialize default joint positions for stable starting stance (slightly bent knees)
         if "biped2d" in self.urdf_path:
+            # Break starting symmetry by randomizing the hips slightly
+            r_hip_init = float(self.np_random.uniform(-0.05, 0.15))
+            l_hip_init = float(self.np_random.uniform(-0.05, 0.15))
             init_joints = {
+                "torso_to_rightleg": r_hip_init,
+                "torso_to_leftleg": l_hip_init,
                 "r_knee": -0.3,
                 "l_knee": -0.3,
             }
@@ -549,6 +619,8 @@ class BipedEnv(gym.Env):
         self.step_count = 0
         self.prev_action = np.zeros(self.num_joints, dtype=np.float32)
         self.prev_dist_to_goal = self.goal_x
+        self.prev_stance_foot = None
+        self.last_alternation_x = 0.0
 
         return self._get_obs(), {}
 
