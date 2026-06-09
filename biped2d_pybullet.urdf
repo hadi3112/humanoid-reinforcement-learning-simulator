@@ -114,7 +114,7 @@
     <parent link="torso"/>
     <child link="r_upperleg"/>
     <axis xyz="1 0 0"/>
-    <limit effort="20.0" lower="-0.14" upper="0.52" velocity="1000.0"/>
+    <limit effort="20.0" lower="-0.2094" upper="0.52" velocity="1000.0"/>
     <dynamics damping="1.0" friction="0.1"/>
     <origin rpy="0 0 0" xyz="0.05 0 -0.085"/>
   </joint>
@@ -146,7 +146,7 @@
     <parent link="torso"/>
     <child link="l_upperleg"/>
     <axis xyz="1 0 0"/>
-    <limit effort="20.0" lower="-0.14" upper="0.52" velocity="1000.0"/>
+    <limit effort="20.0" lower="-0.2094" upper="0.52" velocity="1000.0"/>
     <dynamics damping="1.0" friction="0.1"/>
     <origin rpy="0 0 0" xyz="-0.05 0 -0.085"/>
   </joint>
